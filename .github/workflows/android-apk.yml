@@ -1,19 +1,15 @@
 name: 'Build Android APK (Enejo)'
 
 on:
-  # Run on every push to any branch
   push:
-    branches:
-      - '**'
-  # Also allow manual trigger from the GitHub Actions UI
+    branches: ['**']
   workflow_dispatch:
 
 env:
   QT_VERSION: '6.8.3'
   QT_MODULES: 'qtremoteobjects qt5compat qtimageformats qtshadertools'
   NDK_VERSION: '27.0.11718014'
-  ANDROID_MIN_SDK: 28
-  ANDROID_PLATFORM: 'android-28'
+  ANDROID_MIN_SDK: '28'
   QT_MIRROR: 'https://mirrors.ocf.berkeley.edu/qt/'
 
 jobs:
@@ -22,26 +18,30 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────────────────
+      # ── Checkout ────────────────────────────────────────────────────────────
       - name: 'Checkout source (with submodules)'
         uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
-      # ── 2. Java ────────────────────────────────────────────────────────────
+      # ── Java ────────────────────────────────────────────────────────────────
       - name: 'Setup Java 17'
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      # ── 3. Android SDK + NDK ───────────────────────────────────────────────
-      - name: 'Setup Android SDK'
+      # ── Android SDK + NDK ───────────────────────────────────────────────────
+      - name: 'Setup Android SDK & NDK'
         uses: android-actions/setup-android@v3
         with:
-          packages: "platforms;${{ env.ANDROID_PLATFORM }} ndk;${{ env.NDK_VERSION }} build-tools;34.0.0"
+          packages: >-
+            platforms;android-${{ env.ANDROID_MIN_SDK }}
+            ndk;${{ env.NDK_VERSION }}
+            build-tools;34.0.0
+            cmake;3.22.1
 
-      # ── 4. Qt (desktop host tools + android arm64) ─────────────────────────
+      # ── Qt (desktop host tools + android arm64 only) ────────────────────────
       - name: 'Install desktop Qt (host tools)'
         uses: jurplel/install-qt-action@v4
         with:
@@ -64,7 +64,7 @@ jobs:
           dir: ${{ runner.temp }}
           extra: '--base ${{ env.QT_MIRROR }}'
 
-      # ── 5. Python + Conan ──────────────────────────────────────────────────
+      # ── Python + Conan ──────────────────────────────────────────────────────
       - name: 'Setup Python'
         uses: actions/setup-python@v5
         with:
@@ -73,39 +73,70 @@ jobs:
       - name: 'Install Conan'
         run: pip install "conan==2.28.0"
 
-      # ── 6. ccache ──────────────────────────────────────────────────────────
+      # ── Ninja ───────────────────────────────────────────────────────────────
+      - name: 'Install Ninja'
+        run: sudo apt-get install -y ninja-build
+
+      # ── ccache ──────────────────────────────────────────────────────────────
       - name: 'Setup ccache'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: android-arm64-debug
-          max-size: 1G
+          max-size: 2G
 
-      # ── 7. Build ───────────────────────────────────────────────────────────
-      - name: 'Build debug APK'
+      # ── Build ───────────────────────────────────────────────────────────────
+      - name: 'Configure & Build (CMake direct, arm64-v8a only)'
         env:
           QT_INSTALL_DIR: ${{ runner.temp }}
-          APP_ANDROID_MIN_SDK: ${{ env.ANDROID_MIN_SDK }}
           CMAKE_C_COMPILER_LAUNCHER: ccache
           CMAKE_CXX_COMPILER_LAUNCHER: ccache
         shell: bash
         run: |
           set -euxo pipefail
 
-          # Build using the project's own build script, targeting android, debug
-          deploy/build.sh -t android
+          QT_ROOT="${QT_INSTALL_DIR}/Qt/${{ env.QT_VERSION }}"
+          QT_ANDROID="${QT_ROOT}/android_arm64_v8a"
+          QT_HOST="${QT_ROOT}/gcc_64"
+          TOOLCHAIN="${QT_ANDROID}/lib/cmake/Qt6/qt.toolchain.cmake"
+          NDK_ROOT="${ANDROID_SDK_ROOT}/ndk/${{ env.NDK_VERSION }}"
+          BUILD_DIR="${GITHUB_WORKSPACE}/build"
 
-          # Collect the APK
+          cmake -S "${GITHUB_WORKSPACE}" \
+                -B "${BUILD_DIR}" \
+                -G Ninja \
+                -DCMAKE_BUILD_TYPE=Debug \
+                -DCMAKE_TOOLCHAIN_FILE="${TOOLCHAIN}" \
+                -DQT_HOST_PATH="${QT_HOST}" \
+                -DANDROID_SDK_ROOT="${ANDROID_SDK_ROOT}" \
+                -DANDROID_NDK_ROOT="${NDK_ROOT}" \
+                -DANDROID_PLATFORM="android-${{ env.ANDROID_MIN_SDK }}" \
+                -DAPP_ANDROID_MIN_SDK="${{ env.ANDROID_MIN_SDK }}" \
+                -DQT_ANDROID_ABIS="arm64-v8a" \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+                -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+          cmake --build "${BUILD_DIR}" --parallel 2
+
+      # ── Collect APK ─────────────────────────────────────────────────────────
+      - name: 'Collect APK'
+        shell: bash
+        run: |
           mkdir -p out
-          find deploy/build -name "*.apk" | head -20
-          cp deploy/build/client/android-build/android-build-AmneziaVPN-debug.apk \
-             out/Enejo_debug_arm64-v8a.apk || \
-          find deploy/build -name "*.apk" -exec cp {} out/Enejo_debug_arm64-v8a.apk \;
+          echo "=== Searching for APKs ==="
+          find build -name "*.apk" 2>/dev/null || true
+          APK=$(find build -name "*.apk" | head -1)
+          if [[ -n "$APK" ]]; then
+            cp "$APK" out/Enejo_debug_arm64-v8a.apk
+            echo "✅ APK: $APK"
+            ls -lh out/
+          else
+            echo "❌ No APK found — listing build outputs:"
+            find build -name "*.aab" -o -name "*.apk" 2>/dev/null || true
+            exit 1
+          fi
 
-          echo "✅ APK built:"
-          ls -lh out/
-
-      # ── 8. Upload artifact ─────────────────────────────────────────────────
-      - name: 'Upload APK artifact'
+      # ── Upload ──────────────────────────────────────────────────────────────
+      - name: 'Upload APK'
         uses: actions/upload-artifact@v4
         with:
           name: Enejo-debug-arm64-apk
